@@ -3,7 +3,7 @@ import { Shell } from "./components/shell";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Quant Control",
+  title: "Quant 控制台",
   description: "个人加密货币量化交易控制台",
 };
 

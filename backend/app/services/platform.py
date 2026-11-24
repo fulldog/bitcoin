@@ -1,16 +1,35 @@
-from dataclasses import asdict, is_dataclass
+import re
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from uuid import uuid4
+
+import httpx
 
 from app.backtest.engine import BacktestEngine, lookahead_divergence, walk_forward
+from app.config import get_settings
 from app.domain.filters import SymbolRules
-from app.domain.models import Bar, RunManifest, Side
+from app.domain.models import Bar, OrderIntent, RunManifest, Side
 from app.kernel.runtime import TradingKernel
-from app.market.quality import Dataset, MarketCursor, backoff_seconds
+from app.market.quality import INTERVALS, Dataset, MarketCursor, backoff_seconds
 from app.portfolio.accounting import Portfolio
-from app.risk.engine import RiskLimits
+from app.risk.engine import RiskEngine, RiskLimits, RiskState
 from app.security import live_trading_allowed
-from app.strategies.base import SmaCrossStrategy
+from app.strategies.base import SmaCrossStrategy, StrategyContext
+
+
+def contiguous_closed_bars(bars: list[Bar]) -> list[Bar]:
+    closed = [bar for bar in bars if bar.is_closed]
+    if not closed:
+        return []
+    tail = [closed[-1]]
+    for bar in reversed(closed[:-1]):
+        step = INTERVALS.get(bar.interval)
+        same_series = bar.symbol == tail[0].symbol and bar.interval == tail[0].interval
+        if step is None or not same_series or bar.open_time + step != tail[0].open_time:
+            break
+        tail.insert(0, bar)
+    return tail
 
 
 def parse_kline(message: dict) -> Bar:
@@ -44,6 +63,50 @@ class RateLimiter:
         return True
 
 
+@dataclass
+class PendingSignal:
+    intent: OrderIntent
+    strategy_id: str
+
+
+def pending_intent(item: PendingSignal | OrderIntent) -> OrderIntent:
+    if isinstance(item, PendingSignal):
+        return item.intent
+    return item
+
+
+@dataclass
+class StrategyRunner:
+    id: str
+    name: str
+    symbol: str
+    strategy: SmaCrossStrategy
+    position_qty: Decimal = Decimal(0)
+    cash: Decimal = Decimal(0)
+    entry_price: Decimal | None = None
+    history: list[Bar] = field(default_factory=list)
+    last_decision: str = ""
+    signal_count: int = 0
+    status: str = "running"
+    created_at: str = ""
+
+    def public(self, price: Decimal) -> dict[str, str | int]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "symbol": self.symbol,
+            "status": self.status,
+            "last_decision": self.last_decision or "等待信号",
+            "signal_count": self.signal_count,
+            "position": format(self.position_qty, "f"),
+            "price": format(price, "f"),
+            "created_at": self.created_at,
+            "fast": self.strategy.fast,
+            "slow": self.strategy.slow,
+            "quote_amount": str(self.strategy.quote_amount),
+        }
+
+
 class Platform:
     def __init__(self) -> None:
         self.datasets: dict[str, Dataset] = {}
@@ -55,9 +118,185 @@ class Platform:
         self.metrics: dict[str, object] = {"reconnects": 0, "rejects": 0, "reconciliation_diffs": 0, "order_ack_ms": 0, "heartbeat": None}
         self.kernel: TradingKernel | None = None
         self.cursor = MarketCursor()
-        self.mode = "PAPER"
+        self.mode = "LIVE"
+        self.pending: list[PendingSignal | OrderIntent] = []
+        self.symbols = [get_settings().realtime_symbol.upper()]
+        self.stream_revision = 0
+        self.bars_by_symbol: dict[str, list[Bar]] = {}
+        self.history_loaded: set[str] = set()
+        self.forming: dict[str, Bar] = {}
+        self.prices: dict[str, Decimal] = {}
+        self.runners: dict[str, StrategyRunner] = {}
+        self.llm_reference: dict[str, str] | None = None
         self.live_unlocked = False
+        self.killed = False
+        self.live_orders: list[dict] = []
         self.rules = SymbolRules("BTCUSDT", Decimal("0.01"), Decimal("0.00001"), Decimal("0.00001"), Decimal(5))
+        self.live_bars: list[Bar] = []
+        self.last_price = Decimal(0)
+
+    def ensure_live(self) -> None:
+        if self.kernel is not None:
+            return
+        self.kernel = TradingKernel(
+            SmaCrossStrategy(),
+            Portfolio(Decimal(0)),
+            BacktestEngine(self.rules).risk,
+            self.rules,
+            RunManifest("sma_cross", "1", {}, "live", ("BTCUSDT",), "1m", Decimal("0.001"), Decimal(1)),
+        )
+        self.kernel.update_readiness(True, True)
+        self.mode = "LIVE"
+
+    def ingest_live_bar(self, bar: Bar) -> dict:
+        self.last_price = bar.close
+        self.prices[bar.symbol] = bar.close
+        self.metrics["last_price"] = str(bar.close)
+        self.metrics["last_symbol"] = bar.symbol
+        if not bar.is_closed:
+            self.forming[bar.symbol] = bar
+            return {"accepted": False, "reason": "forming"}
+        self.forming.pop(bar.symbol, None)
+        bucket = self.bars_by_symbol.setdefault(bar.symbol, [])
+        bucket.append(bar)
+        self.bars_by_symbol[bar.symbol] = bucket[-500:]
+        self.cursor.observe(bar)
+        self.live_bars.append(bar)
+        self.live_bars = self.live_bars[-500:]
+        self.ensure_live()
+        assert self.kernel is not None
+        self.kernel.update_readiness(self.cursor.ready, True, data_gap=not self.cursor.ready)
+        intents = [] if self.killed else self._run_strategies(bar)
+        decision = pending_intent(self.pending[-1]).client_order_id if self.pending and intents else ""
+        self.metrics["closed_bars"] = len(self.live_bars)
+        self.metrics["last_decision"] = decision
+        self.metrics["pending_orders"] = len(self.pending)
+        return {"accepted": self.cursor.ready, "signals": len(intents), "decision": decision}
+
+    def add_symbol(self, symbol: str) -> dict[str, list[str]]:
+        normalized = symbol.upper()
+        if re.fullmatch(r"[A-Z0-9]{5,20}", normalized) is None:
+            raise ValueError("币种格式无效")
+        if normalized not in self.symbols:
+            self.symbols.append(normalized)
+            self.stream_revision += 1
+        return {"symbols": self.symbols}
+
+    def cache_history(self, symbol: str, bars: list[Bar]) -> None:
+        normalized = symbol.upper()
+        if not bars:
+            return
+        existing = {bar.open_time: bar for bar in self.bars_by_symbol.get(normalized, [])}
+        existing.update({bar.open_time: bar for bar in bars if bar.symbol == normalized})
+        ordered = sorted(existing.values(), key=lambda bar: bar.open_time)
+        self.bars_by_symbol[normalized] = ordered[-500:]
+        self.prices[normalized] = self.bars_by_symbol[normalized][-1].close
+        self.history_loaded.add(normalized)
+
+    def create_strategy(self, name: str, symbol: str, fast: int, slow: int, quote_amount: Decimal) -> dict[str, str | int]:
+        cleaned = name.strip()
+        if not cleaned or len(cleaned) > 40:
+            raise ValueError("策略名称需要 1 到 40 个字符")
+        if fast >= slow or fast < 1 or slow > 200:
+            raise ValueError("快线必须短于慢线")
+        if quote_amount <= 0:
+            raise ValueError("买入金额必须大于 0")
+        self.add_symbol(symbol)
+        runner = StrategyRunner(
+            id=uuid4().hex[:8],
+            name=cleaned,
+            symbol=symbol.upper(),
+            strategy=SmaCrossStrategy(fast, slow, quote_amount),
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.runners[runner.id] = runner
+        self.logs.append({"event": "strategy_started", "type": runner.symbol, "command_id": runner.id})
+        return runner.public(self.prices.get(runner.symbol, Decimal(0)))
+
+    def strategy_runs(self) -> dict[str, object]:
+        runs = [runner.public(self.prices.get(runner.symbol, Decimal(0))) for runner in self.runners.values()]
+        return {"runs": runs, "symbols": self.symbols, "running": len(runs)}
+
+    def klines(self, symbol: str) -> list[dict[str, str | int]]:
+        normalized = symbol.upper()
+        bars = list(self.bars_by_symbol.get(normalized, []))
+        forming = self.forming.get(normalized)
+        if forming is not None:
+            bars.append(forming)
+        return [
+            {
+                "time": int(bar.open_time.timestamp()),
+                "open": format(bar.open, "f"),
+                "high": format(bar.high, "f"),
+                "low": format(bar.low, "f"),
+                "close": format(bar.close, "f"),
+                "volume": format(bar.volume, "f"),
+            }
+            for bar in bars[-180:]
+        ]
+
+    def _run_strategies(self, bar: Bar) -> list[OrderIntent]:
+        produced: list[OrderIntent] = []
+        for runner in self.runners.values():
+            if runner.symbol != bar.symbol or runner.status != "running":
+                continue
+            runner.history.append(bar)
+            runner.history = runner.history[-500:]
+            context = StrategyContext(runner.history, runner.position_qty, runner.cash, runner.entry_price)
+            intents = runner.strategy.on_bar(context, bar)
+            for intent in intents:
+                self.pending.append(PendingSignal(intent, runner.id))
+                runner.signal_count += 1
+                runner.last_decision = intent.client_order_id or "signal"
+            produced.extend(intents)
+        self.pending = self.pending[-20:]
+        return produced
+
+    def _apply_runner_fill(self, strategy_id: str, side: str, quantity: Decimal, price: Decimal) -> None:
+        runner = self.runners.get(strategy_id)
+        if runner is None or quantity <= 0:
+            return
+        fill_price = price if price > 0 else self.prices.get(runner.symbol, self.last_price)
+        if side == "BUY":
+            runner.position_qty += quantity
+            runner.entry_price = fill_price
+            runner.cash = max(Decimal(0), runner.cash - quantity * fill_price)
+            return
+        runner.position_qty = max(Decimal(0), runner.position_qty - quantity)
+        runner.cash += quantity * fill_price
+        if runner.position_qty == 0:
+            runner.entry_price = None
+
+    def realtime_status(self) -> dict:
+        latest = self.live_bars[-1] if self.live_bars else None
+        return {
+            "stream": self.metrics.get("stream", "stopped"),
+            "symbol": self.metrics.get("last_symbol", "BTCUSDT"),
+            "price": str(self.last_price),
+            "closed_bars": len(self.live_bars),
+            "connector": "READY" if self.cursor.ready else "NOT_READY",
+            "reconnects": self.cursor.reconnects,
+            "last_open_time": latest.open_time.isoformat() if latest else None,
+            "last_decision": self.metrics.get("last_decision", ""),
+            "llm_configured": bool(get_settings().llm_api_key),
+            "llm_bias": (self.llm_reference or {}).get("bias", ""),
+            "llm_confidence": (self.llm_reference or {}).get("confidence", ""),
+            "llm_reason": (self.llm_reference or {}).get("reason", ""),
+            "llm_model": (self.llm_reference or {}).get("model", ""),
+        }
+
+    async def refresh_llm_reference(self, advisor) -> dict[str, str]:
+        closed = [bar for bar in self.live_bars if bar.is_closed]
+        if not closed:
+            raise ValueError("llm reference requires closed bars")
+        latest = closed[-1]
+        position = self.kernel.portfolio.position(latest.symbol) if self.kernel else Decimal(0)
+        cash = self.kernel.portfolio.cash if self.kernel else Decimal(0)
+        reference = await advisor.advise(latest.symbol, closed[-30:], position, cash)
+        stored = {"bias": reference.bias, "confidence": reference.confidence, "reason": reference.reason, "model": reference.model}
+        self.llm_reference = stored
+        self.metrics["llm_bias"] = reference.bias
+        return stored
 
     def data_health(self) -> dict:
         datasets = [
@@ -73,8 +312,19 @@ class Platform:
             self.cursor.observe(dataset.bars[-1])
         return {"id": dataset.dataset_id, "digest": dataset.digest, "ready": dataset.quality.ready, "issues": dataset.quality.issues}
 
+    def dataset_for_backtest(self, dataset_id: str) -> Dataset:
+        existing = self.datasets.get(dataset_id)
+        if existing is not None:
+            return existing
+        bars = contiguous_closed_bars(self.live_bars)
+        if len(bars) < 4:
+            raise ValueError("至少需要 4 根连续闭合 K 线才能回测")
+        dataset = Dataset.freeze(dataset_id, bars)
+        self.datasets[dataset_id] = dataset
+        return dataset
+
     def run_backtest(self, dataset_id: str, cash: Decimal = Decimal(1000)) -> dict:
-        dataset = self.datasets[dataset_id]
+        dataset = self.dataset_for_backtest(dataset_id)
         if not dataset.quality.ready:
             raise ValueError("dataset is not tradable")
         strategy = SmaCrossStrategy()
@@ -105,6 +355,82 @@ class Platform:
         self.backtests[report["id"]] = report
         return report
 
+    async def submit_live_order(self, broker, symbol: str, side: str, quantity: Decimal, reason: str = "", strategy_id: str = "") -> dict:
+        if self.killed or not self.live_unlocked:
+            raise PermissionError("live trading is locked")
+        if self.last_price <= 0:
+            raise ValueError("live order requires a current market price")
+        intent = OrderIntent(symbol.upper(), Side(side.upper()), quantity, client_order_id=f"live{uuid4().hex[:20]}")
+        if self.kernel is not None:
+            account = await broker.account()
+            quote = sum(
+                (Decimal(item["free"]) for item in account["balances"] if item["asset"] in {"USDT", "USDC", "FDUSD"}),
+                Decimal(0),
+            )
+            self.kernel.portfolio.cash = quote
+            base = symbol.upper().removesuffix("USDT").removesuffix("USDC").removesuffix("FDUSD")
+            for item in account["balances"]:
+                if item["asset"] == base:
+                    self.kernel.portfolio.positions[symbol.upper()] = Decimal(item["free"])
+            equity = self.kernel.portfolio.equity({symbol.upper(): self.last_price})
+            self.kernel.state.day_start_equity = equity
+            self.kernel.state.peak_equity = max(self.kernel.state.peak_equity, equity)
+            self.kernel.update_readiness(True, True)
+        portfolio = self.kernel.portfolio if self.kernel else Portfolio(self.last_price * quantity * 2)
+        state = self.kernel.state if self.kernel else RiskState(connector_ready=True, reconciled=True, day_start_equity=portfolio.cash, peak_equity=portfolio.cash)
+        decision = RiskEngine(RiskLimits()).evaluate(
+            intent, portfolio, self.rules, state, datetime.now(timezone.utc), datetime.now(timezone.utc), self.last_price, portfolio.cash
+        )
+        if not decision.allowed:
+            raise PermissionError(decision.message)
+        stored = {
+            "symbol": intent.symbol,
+            "order_id": "",
+            "client_order_id": intent.client_order_id,
+            "status": "CREATED",
+            "executed_quantity": "0",
+            "average_price": "0",
+            "reason": reason,
+        }
+        self.live_orders.append(stored)
+        try:
+            report = await broker.place_order(intent.symbol, intent.side.value, intent.quantity, intent.client_order_id or "")
+        except TimeoutError:
+            stored["status"] = "UNKNOWN"
+            report = await broker.query_order(intent.symbol, intent.client_order_id or "")
+        except (httpx.HTTPError, OSError):
+            stored["status"] = "FAILED"
+            raise
+        stored.update(
+            {
+                "symbol": report.symbol,
+                "order_id": report.order_id,
+                "client_order_id": report.client_order_id,
+                "status": report.status,
+                "executed_quantity": format(report.executed_quantity, "f"),
+                "average_price": format(report.average_price, "f"),
+            }
+        )
+        self._apply_live_fill(intent.symbol, intent.side.value, report.executed_quantity, report.average_price)
+        self._apply_runner_fill(strategy_id, intent.side.value, report.executed_quantity, report.average_price)
+        self.mode = "LIVE"
+        return stored
+
+    def _apply_live_fill(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> None:
+        if self.kernel is None or quantity <= 0:
+            return
+        fill_price = price if price > 0 else self.last_price
+        portfolio = self.kernel.portfolio
+        if side == "BUY":
+            portfolio.positions[symbol] = portfolio.position(symbol) + quantity
+            portfolio.average_prices[symbol] = fill_price
+            portfolio.cash = max(Decimal(0), portfolio.cash - quantity * fill_price)
+            return
+        portfolio.positions[symbol] = max(Decimal(0), portfolio.position(symbol) - quantity)
+        portfolio.cash += quantity * fill_price
+        if portfolio.position(symbol) == 0:
+            portfolio.average_prices.pop(symbol, None)
+
     def enqueue(self, command: dict, idempotency_key: str) -> dict:
         if command.get("type") == "place_order":
             raise PermissionError("control plane cannot place orders directly")
@@ -122,19 +448,10 @@ class Platform:
             command = self.commands.pop(0)
             processed += 1
             if command["type"] == "kill":
+                self.killed = True
                 if self.kernel:
                     self.kernel.kill()
                 self.alerts.append({"severity": "critical", "code": "kill_switch"})
-            elif command["type"] == "start_paper":
-                self.kernel = TradingKernel(
-                    SmaCrossStrategy(),
-                    Portfolio(Decimal(command.get("cash", "1000"))),
-                    BacktestEngine(self.rules).risk,
-                    self.rules,
-                    RunManifest("sma_cross", "1", {}, "live-paper", ("BTCUSDT",), "1h", Decimal("0.001"), Decimal(1)),
-                )
-                self.kernel.update_readiness(True, True)
-                self.mode = "PAPER"
             elif command["type"] == "unlock_live":
                 self.live_unlocked = bool(command["allowed"])
                 self.mode = "LIVE" if self.live_unlocked else self.mode

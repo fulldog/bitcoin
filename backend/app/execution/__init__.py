@@ -1,1 +1,1 @@
-"""Exchange adapters and paper execution."""
+"""Exchange execution adapters."""

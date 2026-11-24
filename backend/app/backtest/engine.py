@@ -73,7 +73,7 @@ class BacktestEngine:
             if portfolio.position(bar.symbol) > 0:
                 exposed += 1
             equity.append(EquityPoint(bar.close_time, mark))
-            context = StrategyContext(bars[: index + 1], portfolio.position(bar.symbol), portfolio.cash)
+            context = StrategyContext(bars[: index + 1], portfolio.position(bar.symbol), portfolio.cash, portfolio.average_prices.get(bar.symbol))
             for offset, intent in enumerate(strategy.on_bar(context, bar)):
                 decision = self.risk.evaluate(intent, portfolio, self.rules, state, bar.close_time, bar.close_time, bar.close, mark)
                 decisions.append(decision)

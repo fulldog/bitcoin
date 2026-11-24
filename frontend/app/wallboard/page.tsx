@@ -20,18 +20,20 @@ export default function WallboardPage() {
       <State loading={summary.loading} error={summary.error} />
       {summary.data && (
         <>
-          <div className="grid">
-            <article className="card"><span>净值</span><strong>{summary.data.equity}</strong></article>
-            <article className="card"><span>当日盈亏</span><strong>{summary.data.daily_pnl}</strong></article>
-            <article className="card"><span>最大回撤</span><strong>{summary.data.drawdown}</strong></article>
-            <article className="card"><span>活动订单</span><strong>{summary.data.open_orders}</strong></article>
+          <div className="metric-row">
+            <article className="metric"><span>净值</span><strong>{summary.data.equity}</strong></article>
+            <article className="metric"><span>当日盈亏</span><strong>{summary.data.daily_pnl}</strong></article>
+            <article className="metric"><span>最大回撤</span><strong>{summary.data.drawdown}</strong></article>
+            <article className="metric"><span>活动订单</span><strong>{summary.data.open_orders}</strong></article>
           </div>
-          <aside className="card">
-            <h1>{summary.data.mode}</h1>
-            <p>心跳：{summary.data.metrics.heartbeat ?? "未运行"}</p>
-            <p>拒单：{summary.data.metrics.rejects}</p>
-            <p>对账差异：{summary.data.metrics.reconciliation_diffs}</p>
-            <p>{summary.data.alerts.length ? summary.data.alerts.map((alert) => alert.code).join("，") : "没有活动告警"}</p>
+          <aside className="panel">
+            <header><h2>{summary.data.mode}</h2></header>
+            <ul className="status-list">
+              <li><span>心跳</span><strong>{summary.data.metrics.heartbeat ?? "未运行"}</strong></li>
+              <li><span>拒单</span><strong>{summary.data.metrics.rejects}</strong></li>
+              <li><span>对账差异</span><strong>{summary.data.metrics.reconciliation_diffs}</strong></li>
+              <li><span>告警</span><em className="tag">{summary.data.alerts.length ? summary.data.alerts.map((alert) => alert.code).join("，") : "无"}</em></li>
+            </ul>
           </aside>
         </>
       )}

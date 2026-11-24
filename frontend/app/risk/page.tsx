@@ -18,19 +18,27 @@ export default function RiskPage() {
   }
 
   return (
-    <section>
-      <h1>风险</h1>
+    <section className="page">
       <State loading={risk.loading} error={risk.error} />
-      {risk.data && <p>就绪：{risk.data.ready ? "是" : "否"}；停止开关：{risk.data.kill_switch ? "已触发" : "未触发"}；数据缺口：{risk.data.data_gap ? "是" : "否"}。</p>}
-      <button type="button" onClick={kill}>全局停止</button>
-      {message && <p role="status">{message}</p>}
-      <div className="table-wrap">
-        <table>
-          <caption>风控决定</caption>
-          <thead><tr><th>代码</th><th>说明</th></tr></thead>
-          <tbody>{risk.data?.decisions.map((item, index) => <tr key={`${item.code}-${index}`}><td>{item.code}</td><td>{item.message}</td></tr>)}</tbody>
-        </table>
+      <div className="banner-row">
+        <article className="banner banner-green"><strong>就绪</strong><p>{risk.data?.ready ? "是" : "否"}</p></article>
+        <article className="banner banner-amber"><strong>停止开关</strong><p>{risk.data?.kill_switch ? "已触发" : "未触发"}</p></article>
+        <article className="banner banner-cyan"><strong>数据缺口</strong><p>{risk.data?.data_gap ? "是" : "否"}</p></article>
+        <article className="banner banner-violet"><strong>决定数</strong><p>{risk.data?.decisions.length ?? 0}</p></article>
       </div>
+      <article className="panel">
+        <header>
+          <h2>风控决定</h2>
+          <button className="danger-btn" type="button" onClick={kill}>全局停止</button>
+        </header>
+        {message && <p role="status">{message}</p>}
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>代码</th><th>说明</th></tr></thead>
+            <tbody>{risk.data?.decisions.map((item, index) => <tr key={`${item.code}-${index}`}><td>{item.code}</td><td>{item.message}</td></tr>)}</tbody>
+          </table>
+        </div>
+      </article>
     </section>
   );
 }

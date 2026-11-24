@@ -85,7 +85,7 @@ def test_kernel_blocks_orders_until_ready_and_replays_snapshot() -> None:
         Portfolio(strategy_cash),
         RiskEngine(RiskLimits(max_order_notional=Decimal(1000), max_symbol_notional=Decimal(1000), max_gross_notional=Decimal(1000))),
         RULES,
-        RunManifest("sma_cross", "1", {}, "paper", ("BTCUSDT",), "1h", Decimal(0), Decimal(0)),
+        RunManifest("sma_cross", "1", {}, "live", ("BTCUSDT",), "1h", Decimal(0), Decimal(0)),
     )
     assert kernel.on_bar(bar(0, "10"), START) == []
     kernel.update_readiness(True, True)
@@ -126,7 +126,7 @@ def test_dependency_outage_blocks_trading() -> None:
         Portfolio(Decimal(1000)),
         RiskEngine(RiskLimits()),
         RULES,
-        RunManifest("sma_cross", "1", {}, "paper", ("BTCUSDT",), "1h", Decimal(0), Decimal(0)),
+        RunManifest("sma_cross", "1", {}, "live", ("BTCUSDT",), "1h", Decimal(0), Decimal(0)),
     )
     kernel.update_readiness(True, True)
     assert run_if_available(lambda: (_ for _ in ()).throw(ConnectionError("postgres unavailable")), kernel) is None

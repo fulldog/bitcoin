@@ -1,1 +1,1 @@
-"""Core domain contracts shared by research, paper, and live modes."""
+"""Core domain contracts shared by research and live execution."""

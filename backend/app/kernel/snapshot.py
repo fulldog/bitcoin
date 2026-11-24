@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from app.execution.paper import PaperAccount
+
+@dataclass
+class AccountSnapshot:
+    cash: Decimal = Decimal(0)
+    position: Decimal = Decimal(0)
 
 
-def save_snapshot(path: Path, account: PaperAccount, status: str) -> None:
+def save_snapshot(path: Path, account: AccountSnapshot, status: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
@@ -18,8 +23,8 @@ def save_snapshot(path: Path, account: PaperAccount, status: str) -> None:
     )
 
 
-def load_snapshot(path: Path) -> tuple[PaperAccount, str]:
+def load_snapshot(path: Path) -> tuple[AccountSnapshot, str]:
     if not path.exists():
-        return PaperAccount(), "CREATED"
+        return AccountSnapshot(), "CREATED"
     data = json.loads(path.read_text(encoding="utf-8"))
-    return PaperAccount(Decimal(data["cash"]), Decimal(data["position"])), data["status"]
+    return AccountSnapshot(Decimal(data["cash"]), Decimal(data["position"])), data["status"]

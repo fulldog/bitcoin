@@ -25,22 +25,36 @@ export default function ResearchPage() {
   }
 
   return (
-    <section>
-      <h1>研究</h1>
+    <section className="page">
       <State loading={strategies.loading} error={strategies.error} empty={!strategies.data?.strategies.length} />
-      {strategies.data?.strategies.map((strategy) => (
-        <article className="card" key={strategy.name}>
-          <h2>{strategy.name} v{strategy.version}</h2>
-          <p className="muted">{Object.entries(strategy.parameters).map(([key, value]) => `${key}=${value}`).join("，")}</p>
+      <div className="split">
+        <article className="panel">
+          <header><h2>策略</h2></header>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>名称</th><th>版本</th><th>参数</th></tr></thead>
+              <tbody>
+                {strategies.data?.strategies.map((strategy) => (
+                  <tr key={strategy.name}>
+                    <td>{strategy.name}</td>
+                    <td>{strategy.version}</td>
+                    <td>{Object.entries(strategy.parameters).map(([key, value]) => `${key}=${value}`).join("，")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </article>
-      ))}
-      <form className="research-edit stack" onSubmit={onSubmit}>
-        <label htmlFor="dataset">数据集</label>
-        <input id="dataset" name="dataset" defaultValue="btc" />
-        <button type="submit">运行回测</button>
-        {error && <p role="alert" className="danger">{error}</p>}
-        {result && <p role="status">回测指纹：{result}</p>}
-      </form>
+        <form className="research-edit" onSubmit={onSubmit}>
+          <h2>运行回测</h2>
+          <label htmlFor="dataset">数据集</label>
+          <input id="dataset" name="dataset" defaultValue="btc" />
+          <p className="muted">未导入该数据集时，使用当前连续的实时闭合 K 线。</p>
+          <button type="submit">运行回测</button>
+          {error && <p role="alert" className="danger">{error}</p>}
+          {result && <p role="status">回测指纹：{result}</p>}
+        </form>
+      </div>
     </section>
   );
 }

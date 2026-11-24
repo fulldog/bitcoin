@@ -90,13 +90,13 @@ class TradingKernel:
         symbol = self.manifest.symbols[0]
         mark = self.portfolio.equity({symbol: bar.close})
         self.state.peak_equity = max(self.state.peak_equity, mark)
-        context = StrategyContext(self.history, self.portfolio.position(symbol), self.portfolio.cash)
+        context = StrategyContext(self.history, self.portfolio.position(symbol), self.portfolio.cash, self.portfolio.average_prices.get(symbol))
         for offset, intent in enumerate(self.strategy.on_bar(context, bar)):
             decision = self.risk.evaluate(intent, self.portfolio, self.rules, self.state, now, bar.close_time, bar.close, mark)
             self.decisions.append(decision)
             if not decision.allowed:
                 continue
-            order = Order(intent.symbol, intent.side, intent.quantity, intent.client_order_id or f"paper-{index}-{offset}")
+            order = Order(intent.symbol, intent.side, intent.quantity, intent.client_order_id or f"live-{index}-{offset}")
             order.transition(OrderStatus.VALIDATED)
             order.transition(OrderStatus.SUBMITTING)
             order.transition(OrderStatus.ACKNOWLEDGED)

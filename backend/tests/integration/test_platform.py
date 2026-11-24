@@ -6,11 +6,13 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.observability import sanitize
 from app.portfolio.accounting import Portfolio
+from app.security import create_token
 from app.services.platform import RateLimiter, parse_kline
 from app.store.db import TradingStore
 from tests.unit.test_domain import bar
 
 client = TestClient(app)
+AUTH = {"Authorization": f"Bearer {create_token('xiongyk')}"}
 
 
 def test_store_write_is_idempotent_and_audit_is_append_only() -> None:
@@ -66,21 +68,21 @@ def test_control_plane_runs_research_without_direct_orders() -> None:
         }
         for item in [bar(index, close) for index, close in enumerate(["10", "10", "10", "12", "14", "16", "13", "9"])]
     ]
-    imported = client.post("/api/datasets", json={"dataset_id": "btc", "bars": bars}, headers={"Idempotency-Key": "import-1"})
+    imported = client.post("/api/datasets", json={"dataset_id": "btc", "bars": bars}, headers={"Idempotency-Key": "import-1", **AUTH})
     assert imported.status_code == 200
     assert imported.json()["ready"] is True
-    report = client.post("/api/backtests?dataset_id=btc", headers={"Idempotency-Key": "backtest-1"})
+    report = client.post("/api/backtests?dataset_id=btc", headers={"Idempotency-Key": "backtest-1", **AUTH})
     assert report.status_code == 200
     body = report.json()
     assert body["assumptions"]["market_fill"] == "next_bar_open"
-    assert client.get(f"/api/backtests/{body['id']}").status_code == 200
-    denied = client.post("/api/orders")
+    assert client.get(f"/api/backtests/{body['id']}", headers=AUTH).status_code == 200
+    denied = client.post("/api/orders", headers=AUTH)
     assert denied.status_code == 403
-    started = client.post("/api/commands", json={"type": "start_paper", "cash": "1000"}, headers={"Idempotency-Key": "start-1"})
-    assert started.status_code == 200
-    assert client.post("/api/runtime/process", headers={"Idempotency-Key": "process-1"}).json()["processed"] == 1
-    summary = client.get("/api/dashboard/summary")
+    stopped = client.post("/api/commands", json={"type": "kill"}, headers={"Idempotency-Key": "kill-1", **AUTH})
+    assert stopped.status_code == 200
+    assert client.post("/api/runtime/process", headers={"Idempotency-Key": "process-1", **AUTH}).json()["processed"] == 1
+    summary = client.get("/api/dashboard/summary", headers=AUTH)
     assert summary.status_code == 200
-    assert summary.json()["mode"] == "PAPER"
-    locked = client.post("/api/live/unlock", json={"confirmation": "wrong"}, headers={"Idempotency-Key": "live-1"})
+    assert summary.json()["mode"] == "LIVE"
+    locked = client.post("/api/live/unlock", json={"confirmation": "wrong"}, headers={"Idempotency-Key": "live-1", **AUTH})
     assert locked.status_code == 403

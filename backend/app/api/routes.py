@@ -1,20 +1,49 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
+from app.adapters.binance_execution import BinanceExecution
+from app.adapters.binance_futures import BinanceFutures
 from app.config import get_settings
+from app.copytrade.aoying import AoyingMonitor, build_copy_plan
+from app.data.binance import BinanceMarketData
 from app.domain.models import Bar
-from app.security import live_trading_allowed
-from app.services.platform import Platform, _jsonable, build_platform
+from app.llm.reference import LlmAdvisor
+from app.market.quality import Dataset
+from app.security import authenticate, create_token, live_trading_allowed, read_token
+from app.services.platform import Platform, _jsonable, build_platform, contiguous_closed_bars
+from app.strategies.base import SmaCrossStrategy
 
 router = APIRouter()
+auth_router = APIRouter()
+bearer = HTTPBearer(auto_error=False)
 _platform = build_platform()
 
 
 def get_platform() -> Platform:
     return _platform
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> str:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return read_token(credentials.credentials)
+
+
+@auth_router.post("/auth/login", tags=["auth"])
+async def login(body: LoginIn) -> dict[str, str]:
+    if not authenticate(body.username, body.password):
+        raise HTTPException(status_code=401, detail="invalid username or password")
+    return {"access_token": create_token(body.username), "token_type": "bearer"}
 
 
 class BarIn(BaseModel):
@@ -36,7 +65,7 @@ class DatasetIn(BaseModel):
 
 
 class CommandIn(BaseModel):
-    type: str = Field(pattern="^(start_paper|pause|kill|unlock_live)$")
+    type: str = Field(pattern="^(pause|kill|unlock_live)$")
     cash: Decimal = Decimal(1000)
 
 
@@ -44,10 +73,27 @@ class UnlockIn(BaseModel):
     confirmation: str
 
 
+class CopyIn(BaseModel):
+    quote_amount: Decimal = Decimal(100)
+    confirmation: str
+
+
+class LiveOrderIn(BaseModel):
+    symbol: str = Field(pattern=r"^[A-Z0-9]{5,20}$")
+    side: str = Field(pattern="^(BUY|SELL)$")
+    quantity: Decimal
+    confirmation: str
+
+
 def _require_key(idempotency_key: str | None) -> str:
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
     return idempotency_key
+
+
+@router.get("/realtime/status", tags=["market"])
+async def realtime_status(platform: Platform = Depends(get_platform)) -> dict:
+    return platform.realtime_status()
 
 
 @router.get("/system/status", tags=["system"])
@@ -93,10 +139,17 @@ async def create_backtest(
     key = _require_key(idempotency_key)
     if key in platform.idempotency:
         return platform.idempotency[key]
+    if dataset_id not in platform.datasets and len(contiguous_closed_bars(platform.live_bars)) < 4:
+        settings = get_settings()
+        try:
+            history = await BinanceMarketData(settings.binance_base_url).fetch_klines(settings.realtime_symbol, settings.realtime_interval, limit=120)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="无法获取 Binance K 线") from exc
+        closed = [bar for bar in history if bar.close_time <= datetime.now(timezone.utc)]
+        if len(closed) >= 4:
+            platform.datasets[dataset_id] = Dataset.freeze(dataset_id, closed)
     try:
         report = platform.run_backtest(dataset_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="dataset not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     platform.idempotency[key] = report
@@ -111,9 +164,82 @@ async def get_backtest(backtest_id: str, platform: Platform = Depends(get_platfo
         raise HTTPException(status_code=404, detail="backtest not found") from exc
 
 
+class SymbolIn(BaseModel):
+    symbol: str
+
+
+class StrategyRunIn(BaseModel):
+    name: str
+    symbol: str
+    fast: int = 2
+    slow: int = 3
+    quote_amount: Decimal = Decimal(90)
+
+
+@router.get("/symbols", tags=["market"])
+async def list_symbols(platform: Platform = Depends(get_platform)) -> dict:
+    return {"symbols": platform.symbols}
+
+
+@router.post("/symbols", tags=["market"])
+async def create_symbol(
+    body: SymbolIn,
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    _require_key(idempotency_key)
+    try:
+        return platform.add_symbol(body.symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/klines", tags=["market"])
+async def klines(symbol: str = "BTCUSDT", platform: Platform = Depends(get_platform)) -> dict:
+    normalized = symbol.upper()
+    if len(platform.klines(normalized)) < 100 and normalized not in platform.history_loaded:
+        settings = get_settings()
+        try:
+            history = await BinanceMarketData(settings.binance_base_url).fetch_klines(
+                normalized,
+                settings.realtime_interval,
+                limit=180,
+            )
+        except httpx.HTTPError as exc:
+            if not platform.klines(normalized):
+                raise HTTPException(status_code=502, detail="无法获取 Binance 历史 K 线") from exc
+        else:
+            closed = [bar for bar in history if bar.close_time <= datetime.now(timezone.utc)]
+            platform.cache_history(normalized, closed)
+    return {"symbol": normalized, "bars": platform.klines(normalized)}
+
+
+@router.get("/strategy-runs", tags=["runtime"])
+async def strategy_runs(platform: Platform = Depends(get_platform)) -> dict:
+    return platform.strategy_runs()
+
+
+@router.post("/strategy-runs", tags=["runtime"])
+async def start_strategy_run(
+    body: StrategyRunIn,
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    key = _require_key(idempotency_key)
+    if key in platform.idempotency:
+        return platform.idempotency[key]
+    try:
+        result = platform.create_strategy(body.name, body.symbol, body.fast, body.slow, body.quote_amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    platform.idempotency[key] = result
+    return result
+
+
 @router.get("/strategies", tags=["research"])
 async def strategies() -> dict:
-    return {"strategies": [{"name": "sma_cross", "version": "1", "parameters": {"fast": 2, "slow": 3, "quote_amount": "100"}}]}
+    strategy = SmaCrossStrategy()
+    return {"strategies": [{"name": strategy.name, "version": strategy.version, "parameters": strategy.parameters()}]}
 
 
 @router.post("/commands", tags=["runtime"])
@@ -144,6 +270,75 @@ async def process_runtime(
 ) -> dict:
     _require_key(idempotency_key)
     return {"processed": platform.process_commands()}
+
+
+def _llm() -> LlmAdvisor:
+    settings = get_settings()
+    if not settings.llm_api_key:
+        raise HTTPException(status_code=409, detail="LLM API key is not configured")
+    return LlmAdvisor(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
+
+
+@router.get("/llm/reference", tags=["research"])
+async def llm_reference(platform: Platform = Depends(get_platform)) -> dict:
+    return {"configured": bool(get_settings().llm_api_key), "reference": platform.llm_reference}
+
+
+@router.post("/llm/reference", tags=["research"])
+async def refresh_llm_reference(
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    key = _require_key(idempotency_key)
+    if key in platform.idempotency:
+        return platform.idempotency[key]
+    try:
+        result = await platform.refresh_llm_reference(_llm())
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (TimeoutError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail="LLM reference request failed") from exc
+    platform.idempotency[key] = result
+    return result
+
+
+def _binance() -> BinanceExecution:
+    settings = get_settings()
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise HTTPException(status_code=409, detail="Binance API key is not configured")
+    return BinanceExecution(settings.binance_base_url, settings.binance_api_key, settings.binance_api_secret)
+
+
+@router.get("/binance/account", tags=["runtime"])
+async def binance_account() -> dict:
+    try:
+        return await _binance().account()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Binance account request failed") from exc
+
+
+@router.post("/live/orders", tags=["runtime"])
+async def place_live_order(
+    body: LiveOrderIn,
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    key = _require_key(idempotency_key)
+    if key in platform.idempotency:
+        return platform.idempotency[key]
+    settings = get_settings()
+    if not live_trading_allowed(settings, body.confirmation, settings.live_build_enabled):
+        raise HTTPException(status_code=403, detail="live trading remains locked")
+    try:
+        result = await platform.submit_live_order(_binance(), body.symbol, body.side, body.quantity)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, TimeoutError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Binance order request failed") from exc
+    platform.idempotency[key] = result
+    return result
 
 
 @router.post("/live/unlock", tags=["runtime"])
@@ -191,6 +386,60 @@ async def risk_status(platform: Platform = Depends(get_platform)) -> dict:
         return {"kill_switch": False, "ready": False, "decisions": []}
     state = platform.kernel.state
     return {"kill_switch": state.kill_switch, "ready": platform.kernel.ready, "data_gap": state.data_gap, "decisions": [_jsonable(item) for item in platform.kernel.decisions]}
+
+
+@router.get("/copy/aoying", tags=["copy"])
+async def aoying_monitor() -> dict:
+    try:
+        return await AoyingMonitor().snapshot()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="无法获取熬鹰公开带单数据") from exc
+
+
+@router.post("/copy/aoying", tags=["copy"])
+async def copy_aoying(
+    body: CopyIn,
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    key = _require_key(idempotency_key)
+    if key in platform.idempotency:
+        return platform.idempotency[key]
+    settings = get_settings()
+    if not live_trading_allowed(settings, body.confirmation, settings.live_build_enabled):
+        raise HTTPException(status_code=403, detail="live trading remains locked")
+    if platform.killed:
+        raise HTTPException(status_code=403, detail="live trading is locked")
+    limit = Decimal(str(settings.max_order_notional))
+    if body.quote_amount <= 0 or body.quote_amount > limit:
+        raise HTTPException(status_code=422, detail=f"跟单金额需要大于 0 且不超过 {limit} USDT")
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        raise HTTPException(status_code=409, detail="Binance API key is not configured")
+    try:
+        snapshot = await AoyingMonitor().snapshot()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="无法获取熬鹰公开带单数据") from exc
+    if not snapshot["positions_public"]:
+        raise HTTPException(status_code=409, detail="带单员未公开当前持仓，不能跟单")
+    positions = snapshot["positions"] if isinstance(snapshot["positions"], list) else []
+    try:
+        plans = build_copy_plan(positions, body.quote_amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    futures = BinanceFutures(settings.binance_futures_base_url, settings.binance_api_key, settings.binance_api_secret)
+    orders: list[dict[str, str]] = []
+    for plan in plans:
+        symbol = str(plan["symbol"])
+        side = str(plan["side"])
+        try:
+            await futures.set_leverage(symbol, int(plan["leverage"]))
+            orders.append(await futures.market_order(symbol, side, Decimal(str(plan["quantity"]))))
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            orders.append({"symbol": symbol, "side": side, "status": "FAILED", "reason": "下单失败"})
+    result = {"orders": orders, "leverage": 1, "quote_amount": format(body.quote_amount, "f")}
+    platform.idempotency[key] = result
+    platform.logs.append({"event": "aoying_copy", "type": "copy", "command_id": key})
+    return result
 
 
 @router.get("/logs", tags=["system"])
