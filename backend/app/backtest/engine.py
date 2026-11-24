@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
-from app.backtest.metrics import performance
+from app.backtest.metrics import Performance, performance
 from app.domain.filters import SymbolRules
 from app.domain.models import (
     Bar,
@@ -38,7 +38,7 @@ class BacktestResult:
     decisions: list
     assumptions: dict
     fill_hash: str
-    metrics: object
+    metrics: Performance
 
 
 class BacktestEngine:

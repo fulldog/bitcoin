@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from app.backtest.engine import RestingOrder, slipped_price
 from app.domain.filters import SymbolRules
-from app.domain.models import Bar, Fill, Order, OrderStatus, RunManifest
+from app.domain.models import Bar, Fill, Order, OrderStatus, RiskDecision, RunManifest
 from app.portfolio.accounting import Portfolio
 from app.risk.engine import RiskEngine, RiskState
 from app.strategies.base import Strategy, StrategyContext
@@ -42,7 +42,7 @@ class TradingKernel:
         self.events: list[dict] = []
         self.history: list[Bar] = []
         self.sequence = 0
-        self.decisions = []
+        self.decisions: list[RiskDecision] = []
         self.strategy.initialize(StrategyContext([], portfolio.position(manifest.symbols[0]), portfolio.cash))
 
     def recover(self, snapshot: RuntimeSnapshot, events: list[dict]) -> None:

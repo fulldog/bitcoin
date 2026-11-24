@@ -7,7 +7,7 @@ from app.config import get_settings
 app = FastAPI(title="Personal Crypto Quant", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],

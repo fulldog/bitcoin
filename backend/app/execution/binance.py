@@ -46,7 +46,7 @@ class BinanceSpotAdapter:
         if order.status is OrderStatus.VALIDATED:
             order.transition(OrderStatus.SUBMITTING)
         try:
-            report = self._place(order)
+            report: ExecutionReport | None = self._place(order)
         except NotSent:
             report = self._place(order)
         except VenueTimeout:
@@ -54,6 +54,8 @@ class BinanceSpotAdapter:
             report = self.transport.get_order(order.client_order_id)
             if report is None:
                 return order
+        if report is None:
+            return order
         self.apply_report(order, report)
         return order
 

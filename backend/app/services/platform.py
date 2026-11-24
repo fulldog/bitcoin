@@ -52,7 +52,7 @@ class Platform:
         self.idempotency: dict[str, dict] = {}
         self.alerts: list[dict] = []
         self.logs: list[dict] = []
-        self.metrics = {"reconnects": 0, "rejects": 0, "reconciliation_diffs": 0, "order_ack_ms": 0, "heartbeat": None}
+        self.metrics: dict[str, object] = {"reconnects": 0, "rejects": 0, "reconciliation_diffs": 0, "order_ack_ms": 0, "heartbeat": None}
         self.kernel: TradingKernel | None = None
         self.cursor = MarketCursor()
         self.mode = "PAPER"
