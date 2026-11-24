@@ -4,6 +4,7 @@ import json
 import httpx
 import websockets
 
+from app.accounts.registry import AccountRegistry
 from app.adapters.binance_execution import BinanceExecution
 from app.config import get_settings
 from app.llm.reference import LlmAdvisor, aligned_intents
@@ -77,6 +78,48 @@ async def flush_pending(platform: Platform) -> None:
             platform.metrics["last_decision"] = str(exc)
             rejects = platform.metrics.get("rejects", 0)
             platform.metrics["rejects"] = rejects + 1 if isinstance(rejects, int) else 1
+
+
+def dispatch_stream_message(platform: Platform, raw: str) -> dict | None:
+    message = json.loads(raw)
+    if "data" in message:
+        message = message["data"]
+    if message.get("e") != "kline":
+        return None
+    bar = parse_kline(message)
+    if bar.symbol not in platform.symbols:
+        return None
+    return platform.ingest_live_bar(bar)
+
+
+async def run_user_streams(registry: AccountRegistry) -> None:
+    attempt = 0
+    while True:
+        symbols = registry.symbols()
+        revision = registry.stream_revision()
+        try:
+            async with websockets.connect(stream_url(symbols), ping_interval=20, ping_timeout=20) as socket:
+                attempt = 0
+                for platform in registry.platforms.values():
+                    platform.metrics["stream"] = "connected"
+                async for raw in socket:
+                    if registry.stream_revision() != revision or registry.symbols() != symbols:
+                        break
+                    text = raw.decode() if isinstance(raw, bytes) else raw
+                    for platform in list(registry.platforms.values()):
+                        dispatch_stream_message(platform, text)
+                        await flush_pending(platform)
+        except asyncio.CancelledError:
+            for platform in registry.platforms.values():
+                platform.metrics["stream"] = "stopped"
+            raise
+        except (OSError, TimeoutError, websockets.WebSocketException):
+            attempt += 1
+            for platform in registry.platforms.values():
+                platform.cursor.disconnect()
+                platform.metrics["stream"] = "reconnecting"
+                platform.metrics["reconnects"] = platform.cursor.reconnects
+            await asyncio.sleep(backoff_seconds(attempt))
 
 
 async def run_market_stream(platform: Platform) -> None:

@@ -131,6 +131,10 @@ class Platform:
         self.live_unlocked = False
         self.killed = False
         self.live_orders: list[dict] = []
+        self.fills: list[dict] = []
+        self.owner = ""
+        self.ledger = None
+        self.exposure_ok = True
         self.rules = SymbolRules("BTCUSDT", Decimal("0.01"), Decimal("0.00001"), Decimal("0.00001"), Decimal(5))
         self.live_bars: list[Bar] = []
         self.last_price = Decimal(0)
@@ -211,11 +215,46 @@ class Platform:
         )
         self.runners[runner.id] = runner
         self.logs.append({"event": "strategy_started", "type": runner.symbol, "command_id": runner.id})
+        self._persist_runner(runner)
         return runner.public(self.prices.get(runner.symbol, Decimal(0)))
 
     def strategy_runs(self) -> dict[str, object]:
         runs = [runner.public(self.prices.get(runner.symbol, Decimal(0))) for runner in self.runners.values()]
-        return {"runs": runs, "symbols": self.symbols, "running": len(runs)}
+        running = len([runner for runner in self.runners.values() if runner.status == "running"])
+        return {"runs": runs, "symbols": self.symbols, "running": running}
+
+    def start_strategy(self, strategy_id: str) -> dict[str, str | int]:
+        runner = self.runners.get(strategy_id)
+        if runner is None:
+            raise KeyError(strategy_id)
+        runner.status = "running"
+        runner.last_decision = "已启动"
+        self.logs.append({"event": "strategy_started", "type": runner.symbol, "command_id": runner.id})
+        self._persist_runner(runner)
+        return runner.public(self.prices.get(runner.symbol, Decimal(0)))
+
+    async def stop_strategy(self, broker, strategy_id: str) -> dict[str, object]:
+        runner = self.runners.get(strategy_id)
+        if runner is None:
+            raise KeyError(strategy_id)
+        if runner.status != "running":
+            raise ValueError("策略已经关闭")
+        order = None
+        if runner.position_qty > 0:
+            if broker is None:
+                raise ValueError("缺少交易所连接，不能市价卖出")
+            price = self.prices.get(runner.symbol, Decimal(0))
+            if price <= 0:
+                raise ValueError("缺少当前价格，不能市价卖出")
+            order = await self.submit_live_order(broker, runner.symbol, "SELL", runner.position_qty, "strategy_stop", runner.id)
+            if runner.position_qty > 0:
+                raise ValueError("持仓未全部卖出，策略保持运行")
+        self.pending = [item for item in self.pending if not (isinstance(item, PendingSignal) and item.strategy_id == runner.id)]
+        runner.status = "stopped"
+        runner.last_decision = "已关闭并卖出" if order else "已关闭"
+        self.logs.append({"event": "strategy_stopped", "type": runner.symbol, "command_id": runner.id})
+        self._persist_runner(runner)
+        return {"strategy": runner.public(self.prices.get(runner.symbol, Decimal(0))), "order": order}
 
     def klines(self, symbol: str) -> list[dict[str, str | int]]:
         normalized = symbol.upper()
@@ -261,11 +300,13 @@ class Platform:
             runner.position_qty += quantity
             runner.entry_price = fill_price
             runner.cash = max(Decimal(0), runner.cash - quantity * fill_price)
+            self._persist_runner(runner)
             return
         runner.position_qty = max(Decimal(0), runner.position_qty - quantity)
         runner.cash += quantity * fill_price
         if runner.position_qty == 0:
             runner.entry_price = None
+        self._persist_runner(runner)
 
     def realtime_status(self) -> dict:
         latest = self.live_bars[-1] if self.live_bars else None
@@ -304,6 +345,94 @@ class Platform:
             for item in self.datasets.values()
         ]
         return {"connector": "READY" if self.cursor.ready else "NOT_READY", "datasets": datasets, "reconnects": self.cursor.reconnects}
+
+    def attach_ledger(self, username: str, store) -> None:
+        self.owner = username
+        self.ledger = store
+        for row in store.strategies(username):
+            runner = StrategyRunner(
+                id=row.strategy_id,
+                name=row.name,
+                symbol=row.symbol,
+                strategy=SmaCrossStrategy(row.fast, row.slow, Decimal(row.quote_amount)),
+                position_qty=Decimal(row.position_qty),
+                cash=Decimal(row.cash or "0"),
+                entry_price=Decimal(row.entry_price) if row.entry_price else None,
+                last_decision=row.last_decision,
+                signal_count=row.signal_count,
+                status=row.status,
+                created_at=row.created_at,
+            )
+            self.runners[runner.id] = runner
+            if runner.symbol not in self.symbols:
+                self.symbols.append(runner.symbol)
+        self.live_orders = store.orders(username)
+        self.fills = store.fills(username)
+        if len(self.symbols) > 1:
+            self.stream_revision += 1
+
+    def _runner_payload(self, runner: StrategyRunner) -> dict[str, str | int]:
+        return {
+            "id": runner.id,
+            "name": runner.name,
+            "symbol": runner.symbol,
+            "fast": runner.strategy.fast,
+            "slow": runner.strategy.slow,
+            "quote_amount": str(runner.strategy.quote_amount),
+            "status": runner.status,
+            "position_qty": format(runner.position_qty, "f"),
+            "cash": format(runner.cash, "f"),
+            "entry_price": "" if runner.entry_price is None else format(runner.entry_price, "f"),
+            "last_decision": runner.last_decision,
+            "signal_count": runner.signal_count,
+            "created_at": runner.created_at,
+        }
+
+    def _persist_runner(self, runner: StrategyRunner) -> None:
+        if self.ledger is None or not self.owner:
+            return
+        self.ledger.save_strategy(self.owner, self._runner_payload(runner))
+
+    def _persist_order(self, payload: dict) -> None:
+        if self.ledger is None or not self.owner:
+            return
+        self.ledger.save_order(self.owner, payload)
+
+    def _persist_fill(self, payload: dict) -> None:
+        if self.ledger is None or not self.owner:
+            return
+        self.ledger.save_fill(self.owner, payload)
+        self.fills.append(payload)
+
+    def _alert(self, code: str, message: str) -> None:
+        if any(item.get("code") == code for item in self.alerts):
+            return
+        self.alerts.append({"code": code, "severity": "warning", "message": message})
+
+    async def reconcile_balances(self, broker) -> dict:
+        account = await broker.account()
+        balances = {
+            item["asset"]: Decimal(item["free"]) + Decimal(item["locked"])
+            for item in account["balances"]
+        }
+        held: dict[str, Decimal] = {}
+        for runner in self.runners.values():
+            held[runner.symbol] = held.get(runner.symbol, Decimal(0)) + runner.position_qty
+        diffs = []
+        for symbol, quantity in held.items():
+            if quantity <= 0:
+                continue
+            base = symbol.removesuffix("USDT").removesuffix("USDC").removesuffix("FDUSD")
+            exchange = balances.get(base, Decimal(0))
+            if quantity > exchange:
+                diffs.append({"symbol": symbol, "local": format(quantity, "f"), "exchange": format(exchange, "f")})
+        self.exposure_ok = not diffs
+        self.metrics["reconciliation_diffs"] = len(diffs)
+        if diffs:
+            self._alert("position_mismatch", "本地持仓多于交易所余额，已禁止开仓")
+        else:
+            self.alerts = [item for item in self.alerts if item.get("code") != "position_mismatch"]
+        return {"ok": self.exposure_ok, "diffs": diffs, "balances": _jsonable(balances)}
 
     def import_bars(self, dataset_id: str, bars: list[Bar]) -> dict:
         dataset = Dataset.freeze(dataset_id, bars)
@@ -358,7 +487,10 @@ class Platform:
     async def submit_live_order(self, broker, symbol: str, side: str, quantity: Decimal, reason: str = "", strategy_id: str = "") -> dict:
         if self.killed or not self.live_unlocked:
             raise PermissionError("live trading is locked")
-        if self.last_price <= 0:
+        if side.upper() == "BUY" and not self.exposure_ok:
+            raise PermissionError("持仓与交易所不一致，已禁止开仓")
+        price = self.prices.get(symbol.upper(), self.last_price)
+        if price <= 0:
             raise ValueError("live order requires a current market price")
         intent = OrderIntent(symbol.upper(), Side(side.upper()), quantity, client_order_id=f"live{uuid4().hex[:20]}")
         if self.kernel is not None:
@@ -372,14 +504,15 @@ class Platform:
             for item in account["balances"]:
                 if item["asset"] == base:
                     self.kernel.portfolio.positions[symbol.upper()] = Decimal(item["free"])
-            equity = self.kernel.portfolio.equity({symbol.upper(): self.last_price})
+            equity = self.kernel.portfolio.equity({symbol.upper(): price})
             self.kernel.state.day_start_equity = equity
             self.kernel.state.peak_equity = max(self.kernel.state.peak_equity, equity)
             self.kernel.update_readiness(True, True)
-        portfolio = self.kernel.portfolio if self.kernel else Portfolio(self.last_price * quantity * 2)
-        state = self.kernel.state if self.kernel else RiskState(connector_ready=True, reconciled=True, day_start_equity=portfolio.cash, peak_equity=portfolio.cash)
+        portfolio = self.kernel.portfolio if self.kernel else Portfolio(price * quantity * 2)
+        equity = portfolio.equity({symbol.upper(): price})
+        state = self.kernel.state if self.kernel else RiskState(connector_ready=True, reconciled=True, day_start_equity=equity, peak_equity=equity)
         decision = RiskEngine(RiskLimits()).evaluate(
-            intent, portfolio, self.rules, state, datetime.now(timezone.utc), datetime.now(timezone.utc), self.last_price, portfolio.cash
+            intent, portfolio, self.rules, state, datetime.now(timezone.utc), datetime.now(timezone.utc), price, equity
         )
         if not decision.allowed:
             raise PermissionError(decision.message)
@@ -391,15 +524,21 @@ class Platform:
             "executed_quantity": "0",
             "average_price": "0",
             "reason": reason,
+            "side": intent.side.value,
+            "quantity": format(intent.quantity, "f"),
+            "strategy_id": strategy_id,
         }
         self.live_orders.append(stored)
+        self._persist_order(stored)
         try:
             report = await broker.place_order(intent.symbol, intent.side.value, intent.quantity, intent.client_order_id or "")
         except TimeoutError:
             stored["status"] = "UNKNOWN"
+            self._persist_order(stored)
             report = await broker.query_order(intent.symbol, intent.client_order_id or "")
         except (httpx.HTTPError, OSError):
             stored["status"] = "FAILED"
+            self._persist_order(stored)
             raise
         stored.update(
             {
@@ -413,6 +552,18 @@ class Platform:
         )
         self._apply_live_fill(intent.symbol, intent.side.value, report.executed_quantity, report.average_price)
         self._apply_runner_fill(strategy_id, intent.side.value, report.executed_quantity, report.average_price)
+        self._persist_order(stored)
+        if report.executed_quantity > 0:
+            self._persist_fill(
+                {
+                    "strategy_id": strategy_id,
+                    "symbol": intent.symbol,
+                    "side": intent.side.value,
+                    "quantity": format(report.executed_quantity, "f"),
+                    "price": format(report.average_price, "f"),
+                    "client_order_id": stored["client_order_id"],
+                }
+            )
         self.mode = "LIVE"
         return stored
 

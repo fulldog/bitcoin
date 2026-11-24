@@ -5,7 +5,7 @@ import { State } from "../components/shell";
 import { postJson } from "../lib/api";
 import { useApi } from "../lib/use-api";
 
-type Risk = { kill_switch: boolean; ready: boolean; data_gap?: boolean; decisions: { code: string; message: string }[] };
+type Risk = { kill_switch: boolean; ready: boolean; data_gap?: boolean; exposure_ok?: boolean; alerts?: { code: string; message?: string }[]; decisions: { code: string; message: string }[] };
 
 export default function RiskPage() {
   const risk = useApi<Risk>("/api/risk", 5000);
@@ -32,6 +32,8 @@ export default function RiskPage() {
           <button className="danger-btn" type="button" onClick={kill}>全局停止</button>
         </header>
         {message && <p role="status">{message}</p>}
+        {risk.data?.exposure_ok === false && <p className="danger">本地持仓多于交易所余额，已禁止新的买入。</p>}
+        {risk.data?.alerts?.map((alert) => <p key={alert.code} className="danger">{alert.message || alert.code}</p>)}
         <div className="table-wrap">
           <table>
             <thead><tr><th>代码</th><th>说明</th></tr></thead>

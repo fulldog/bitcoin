@@ -18,6 +18,7 @@ export default function OverviewPage() {
   const chartSymbol = symbol || strategies.data?.symbols[0] || realtime.data?.symbol || "BTCUSDT";
   const candles = useApi<Klines>(`/api/klines?symbol=${chartSymbol}`, 5000);
   const market = realtime.data;
+  const runningStrategies = strategies.data?.runs.filter((run) => run.status === "running") ?? [];
   const ready = market?.connector === "READY";
   return (
     <section className="page">
@@ -34,12 +35,12 @@ export default function OverviewPage() {
         <CandleChart bars={candles.data?.bars ?? []} />
       </article>
       <article className="panel">
-        <header><h2>运行中的策略</h2><span className="tag tag-ok">{strategies.data?.running ?? 0} 个</span></header>
+        <header><h2>运行中的策略</h2><span className={strategies.data?.running ? "tag tag-ok" : "tag tag-off"}>{strategies.data?.running ?? 0} 个</span></header>
         <div className="table-wrap">
           <table>
             <thead><tr><th>名称</th><th>币种</th><th>参数</th><th>价格</th><th>持仓</th><th>最近决策</th><th>信号</th></tr></thead>
             <tbody>
-              {strategies.data?.runs.map((run) => (
+              {runningStrategies.map((run) => (
                 <tr key={run.id}>
                   <td>{run.name}</td>
                   <td>{run.symbol}</td>
@@ -53,7 +54,7 @@ export default function OverviewPage() {
             </tbody>
           </table>
         </div>
-        {strategies.data && !strategies.data.runs.length && <p className="muted">还没有运行中的策略。到运行页创建后会自动开始。</p>}
+        {strategies.data && !runningStrategies.length && <p className="muted">还没有运行中的策略。到运行页创建后会自动开始。</p>}
       </article>
       <div className="banner-row">
         <article className="banner banner-green">

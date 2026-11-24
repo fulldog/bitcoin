@@ -6,31 +6,22 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
+from app.accounts.registry import get_registry
 from app.adapters.binance_execution import BinanceExecution
 from app.adapters.binance_futures import BinanceFutures
 from app.config import get_settings
 from app.copytrade.aoying import AoyingMonitor, build_copy_plan
-from app.data.binance import BinanceMarketData
+from app.data.binance import BinanceMarketData, previous_utc_day
 from app.domain.models import Bar
 from app.llm.reference import LlmAdvisor
-from app.market.quality import Dataset
+from app.market.quality import INTERVALS, Dataset
 from app.security import authenticate, create_token, live_trading_allowed, read_token
-from app.services.platform import Platform, _jsonable, build_platform, contiguous_closed_bars
+from app.services.platform import Platform, _jsonable, contiguous_closed_bars
 from app.strategies.base import SmaCrossStrategy
 
 router = APIRouter()
 auth_router = APIRouter()
 bearer = HTTPBearer(auto_error=False)
-_platform = build_platform()
-
-
-def get_platform() -> Platform:
-    return _platform
-
-
-class LoginIn(BaseModel):
-    username: str
-    password: str
 
 
 def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> str:
@@ -39,11 +30,63 @@ def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     return read_token(credentials.credentials)
 
 
+def get_platform(username: str = Depends(require_user)) -> Platform:
+    try:
+        return get_registry().platform_for(username)
+    except KeyError as exc:
+        raise HTTPException(status_code=401, detail="login required") from exc
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
 @auth_router.post("/auth/login", tags=["auth"])
 async def login(body: LoginIn) -> dict[str, str]:
     if not authenticate(body.username, body.password):
         raise HTTPException(status_code=401, detail="invalid username or password")
     return {"access_token": create_token(body.username), "token_type": "bearer"}
+
+
+@auth_router.get("/auth/me", tags=["auth"])
+async def current_user(username: str = Depends(require_user)) -> dict[str, str]:
+    account = get_registry().users.find(username)
+    if account is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return {"username": account.username, "role": account.role}
+
+
+class UserIn(BaseModel):
+    username: str
+    password: str
+
+
+@router.get("/users", tags=["auth"])
+async def list_users(username: str = Depends(require_user)) -> dict[str, list[dict[str, str]]]:
+    directory = get_registry().users
+    if not directory.is_admin(username):
+        raise HTTPException(status_code=403, detail="只有管理员可以查看用户")
+    return {"users": directory.list_public()}
+
+
+@router.post("/users", tags=["auth"])
+async def create_user(
+    body: UserIn,
+    username: str = Depends(require_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, str]:
+    _require_key(idempotency_key)
+    directory = get_registry().users
+    if not directory.is_admin(username):
+        raise HTTPException(status_code=403, detail="只有管理员可以新增用户")
+    try:
+        account = directory.create(body.username, body.password)
+    except ValueError as exc:
+        status = 409 if "已存在" in str(exc) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    get_registry().platform_for(account.username)
+    return {"username": account.username, "role": account.role, "created_at": account.created_at}
 
 
 class BarIn(BaseModel):
@@ -168,6 +211,11 @@ class SymbolIn(BaseModel):
     symbol: str
 
 
+class T1ResearchIn(BaseModel):
+    symbol: str = Field(default="BTCUSDT", pattern=r"^[A-Z0-9]{5,20}$")
+    interval: str = "1h"
+
+
 class StrategyRunIn(BaseModel):
     name: str
     symbol: str
@@ -232,6 +280,87 @@ async def start_strategy_run(
         result = platform.create_strategy(body.name, body.symbol, body.fast, body.slow, body.quote_amount)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    platform.idempotency[key] = result
+    return result
+
+
+@router.post("/strategy-runs/{strategy_id}/start", tags=["runtime"])
+async def resume_strategy_run(
+    strategy_id: str,
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    key = _require_key(idempotency_key)
+    if key in platform.idempotency:
+        return platform.idempotency[key]
+    try:
+        result = platform.start_strategy(strategy_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="策略不存在") from exc
+    platform.idempotency[key] = result
+    return result
+
+
+@router.post("/strategy-runs/{strategy_id}/stop", tags=["runtime"])
+async def stop_strategy_run(
+    strategy_id: str,
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    key = _require_key(idempotency_key)
+    if key in platform.idempotency:
+        return platform.idempotency[key]
+    runner = platform.runners.get(strategy_id)
+    if runner is None:
+        raise HTTPException(status_code=404, detail="策略不存在")
+    try:
+        result = await platform.stop_strategy(_binance() if runner.position_qty > 0 else None, strategy_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="策略不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (TimeoutError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail="市价卖出失败") from exc
+    platform.idempotency[key] = result
+    return result
+
+
+@router.post("/research/t1", tags=["research"])
+async def research_previous_day(
+    body: T1ResearchIn,
+    platform: Platform = Depends(get_platform),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    key = _require_key(idempotency_key)
+    if key in platform.idempotency:
+        return platform.idempotency[key]
+    if body.interval not in INTERVALS:
+        raise HTTPException(status_code=422, detail="不支持的周期")
+    start, end = previous_utc_day()
+    try:
+        bars = await BinanceMarketData(get_settings().binance_base_url).fetch_closed_range(body.symbol, body.interval, start, end)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="无法获取昨日 K 线") from exc
+    if len(bars) < 4:
+        raise HTTPException(status_code=409, detail="昨日闭合 K 线不足")
+    dataset_id = f"{body.symbol}-{body.interval}-{start.date().isoformat()}"
+    imported = platform.import_bars(dataset_id, bars)
+    if not imported["ready"]:
+        raise HTTPException(status_code=409, detail="昨日行情不连续，不能回测")
+    try:
+        report = platform.run_backtest(dataset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    result = {
+        "dataset_id": dataset_id,
+        "day": start.date().isoformat(),
+        "bars": len(bars),
+        "id": report["id"],
+        "fill_hash": report["fill_hash"],
+        "metrics": report.get("metrics", {}),
+    }
     platform.idempotency[key] = result
     return result
 
@@ -368,24 +497,29 @@ async def dashboard_summary(platform: Platform = Depends(get_platform)) -> dict:
 
 @router.get("/orders", tags=["orders"])
 async def list_orders(platform: Platform = Depends(get_platform)) -> dict:
-    if not platform.kernel:
-        return {"orders": []}
-    return {"orders": [_jsonable(item.order) for item in platform.kernel.resting]}
+    resting = [_jsonable(item.order) for item in platform.kernel.resting] if platform.kernel else []
+    return {"orders": platform.live_orders + resting}
 
 
 @router.get("/fills", tags=["orders"])
 async def list_fills(platform: Platform = Depends(get_platform)) -> dict:
-    if not platform.kernel:
-        return {"fills": []}
-    return {"fills": [_jsonable(fill) for fill in platform.kernel.fills]}
+    kernel_fills = [_jsonable(fill) for fill in platform.kernel.fills] if platform.kernel else []
+    return {"fills": platform.fills + kernel_fills}
 
 
 @router.get("/risk", tags=["risk"])
 async def risk_status(platform: Platform = Depends(get_platform)) -> dict:
     if not platform.kernel:
-        return {"kill_switch": False, "ready": False, "decisions": []}
+        return {"kill_switch": False, "ready": False, "data_gap": False, "exposure_ok": platform.exposure_ok, "alerts": platform.alerts, "decisions": []}
     state = platform.kernel.state
-    return {"kill_switch": state.kill_switch, "ready": platform.kernel.ready, "data_gap": state.data_gap, "decisions": [_jsonable(item) for item in platform.kernel.decisions]}
+    return {
+        "kill_switch": state.kill_switch,
+        "ready": platform.kernel.ready,
+        "data_gap": state.data_gap,
+        "exposure_ok": platform.exposure_ok,
+        "alerts": platform.alerts,
+        "decisions": [_jsonable(item) for item in platform.kernel.decisions],
+    }
 
 
 @router.get("/copy/aoying", tags=["copy"])

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
@@ -49,6 +49,36 @@ class BinanceMarketData:
         finally:
             if owns_client:
                 await client.aclose()
+
+    async def fetch_closed_range(self, symbol: str, interval: str, start: datetime, end: datetime) -> list[Bar]:
+        collected: list[Bar] = []
+        cursor = int(start.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+        now = datetime.now(timezone.utc)
+        while cursor < end_ms and len(collected) < 5000:
+            batch = await self.fetch_klines(symbol, interval, limit=1000, start_time=cursor)
+            if not batch:
+                break
+            collected.extend(batch)
+            nxt = int(batch[-1].open_time.timestamp() * 1000) + 1
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(batch) < 1000:
+                break
+        unique = {
+            bar.open_time: bar
+            for bar in collected
+            if start <= bar.open_time < end and bar.close_time <= now
+        }
+        return [unique[key] for key in sorted(unique)]
+
+
+def previous_utc_day(now: datetime | None = None) -> tuple[datetime, datetime]:
+    moment = now or datetime.now(timezone.utc)
+    day = moment.astimezone(timezone.utc).date() - timedelta(days=1)
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    return start, start + timedelta(days=1)
 
 
 @dataclass(frozen=True, slots=True)

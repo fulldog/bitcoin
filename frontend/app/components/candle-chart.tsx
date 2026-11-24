@@ -37,26 +37,26 @@ export function CandleChart({ bars }: { bars: Candle[] }) {
     const chart = createChart(container, {
       autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: "#ffffff" },
-        textColor: "#667085",
+        background: { type: ColorType.Solid, color: "#1b1f1a" },
+        textColor: "#9b9588",
         fontFamily: '"Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
         fontSize: 12,
       },
       grid: {
-        vertLines: { color: "#eef1f6" },
-        horzLines: { color: "#eef1f6" },
+        vertLines: { color: "rgba(236, 226, 204, 0.06)" },
+        horzLines: { color: "rgba(236, 226, 204, 0.06)" },
       },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: { color: "#98a2b3", width: 1, style: 3, labelBackgroundColor: "#344054" },
-        horzLine: { color: "#98a2b3", width: 1, style: 3, labelBackgroundColor: "#344054" },
+        vertLine: { color: "#e0b56a", width: 1, style: 3, labelBackgroundColor: "#2a261c" },
+        horzLine: { color: "#e0b56a", width: 1, style: 3, labelBackgroundColor: "#2a261c" },
       },
       rightPriceScale: {
-        borderColor: "#e6eaf2",
+        borderColor: "rgba(236, 226, 204, 0.12)",
         scaleMargins: { top: 0.08, bottom: 0.24 },
       },
       timeScale: {
-        borderColor: "#e6eaf2",
+        borderColor: "rgba(236, 226, 204, 0.12)",
         timeVisible: true,
         secondsVisible: false,
         rightOffset: 6,
@@ -77,19 +77,19 @@ export function CandleChart({ bars }: { bars: Candle[] }) {
       },
     });
     const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: "#17803d",
-      downColor: "#c2414b",
-      borderUpColor: "#17803d",
-      borderDownColor: "#c2414b",
-      wickUpColor: "#17803d",
-      wickDownColor: "#c2414b",
+      upColor: "#9dcc78",
+      downColor: "#e08a80",
+      borderUpColor: "#9dcc78",
+      borderDownColor: "#e08a80",
+      wickUpColor: "#9dcc78",
+      wickDownColor: "#e08a80",
       priceLineVisible: true,
       lastValueVisible: true,
     });
     const volumeSeries = chart.addSeries(HistogramSeries, {
       priceFormat: { type: "volume" },
       priceScaleId: "",
-      color: "rgba(59, 102, 245, 0.20)",
+      color: "rgba(224, 181, 106, 0.28)",
       priceLineVisible: false,
       lastValueVisible: false,
     });
@@ -142,7 +142,7 @@ export function CandleChart({ bars }: { bars: Candle[] }) {
     volumeSeries.setData(sorted.map((bar) => ({
       time: bar.time as UTCTimestamp,
       value: Number(bar.volume ?? 0),
-      color: Number(bar.close) >= Number(bar.open) ? "rgba(23, 128, 61, 0.22)" : "rgba(194, 65, 75, 0.22)",
+      color: Number(bar.close) >= Number(bar.open) ? "rgba(157, 204, 120, 0.28)" : "rgba(224, 138, 128, 0.28)",
     })));
     const range = sorted.length ? `${sorted[0].time}:${sorted[sorted.length - 1].time}` : "";
     if (range && range !== rangeRef.current) {

@@ -1,4 +1,3 @@
-import hmac
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -15,16 +14,10 @@ def live_trading_allowed(settings: Settings, confirmation: str | None, build_ena
     )
 
 
-def _same(left: str, right: str) -> bool:
-    raw_left, raw_right = left.encode(), right.encode()
-    if len(raw_left) != len(raw_right):
-        return False
-    return hmac.compare_digest(raw_left, raw_right)
-
-
 def authenticate(username: str, password: str) -> bool:
-    settings = get_settings()
-    return _same(username, settings.auth_username) and _same(password, settings.auth_password)
+    from app.accounts.directory import get_directory
+
+    return get_directory().verify(username, password)
 
 
 def create_token(username: str) -> str:
@@ -40,6 +33,10 @@ def read_token(token: str) -> str:
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="login required") from exc
     subject = payload.get("sub")
-    if subject != settings.auth_username:
+    if not isinstance(subject, str):
         raise HTTPException(status_code=401, detail="login required")
-    return str(subject)
+    from app.accounts.directory import get_directory
+
+    if get_directory().find(subject) is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return subject

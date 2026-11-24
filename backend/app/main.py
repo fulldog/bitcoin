@@ -1,22 +1,45 @@
 import asyncio
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth_router, get_platform, require_user, router
+from app.accounts.registry import AccountRegistry, get_registry
+from app.adapters.binance_execution import BinanceExecution
+from app.api.routes import auth_router, require_user, router
 from app.config import get_settings
-from app.market.stream import run_market_stream
+from app.market.stream import run_user_streams
+
+
+async def reconcile_accounts(registry: AccountRegistry) -> None:
+    settings = get_settings()
+    if not settings.binance_api_key or not settings.binance_api_secret:
+        return
+    broker = BinanceExecution(settings.binance_base_url, settings.binance_api_key, settings.binance_api_secret)
+    for platform in list(registry.platforms.values()):
+        try:
+            await platform.reconcile_balances(broker)
+        except (OSError, TimeoutError, httpx.HTTPError, ValueError):
+            platform._alert("reconcile_failed", "无法连接 Binance 完成对账")
+
+
+async def reconcile_loop(registry: AccountRegistry) -> None:
+    while True:
+        await reconcile_accounts(registry)
+        await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
-    task = None
+    tasks = []
     if get_settings().realtime_enabled:
-        task = asyncio.create_task(run_market_stream(get_platform()))
+        registry = get_registry()
+        tasks.append(asyncio.create_task(run_user_streams(registry)))
+        tasks.append(asyncio.create_task(reconcile_loop(registry)))
     yield
-    if task is not None:
+    for task in tasks:
         task.cancel()
 
 

@@ -2,7 +2,11 @@
 
 ## 环境
 
-复制 `.env.example` 为 `.env`，不要提交 `.env`。本地测试可以使用 SQLite；Docker Compose 部署使用 PostgreSQL 和 Redis。Redis 只保存短期任务和通知，订单、成交、余额和审计事件以 PostgreSQL 为准。
+复制 `.env.example` 为 `.env`，不要提交 `.env`。当前运行时使用 SQLite，库文件默认是 `backend/quant.db`。连接串是 `DATABASE_URL=sqlite+aiosqlite:///./quant.db`，进程内会改用 `sqlite+pysqlite`。测试使用 `sqlite+pysqlite:///:memory:`。
+
+已落库的表是 `users`、`strategy_states`、`live_orders`、`fill_ledger`、`candles` 和 `audit_events`。用户、策略状态、实盘订单和成交在 API 重启后恢复。实时 K 线、回测报告、实盘解锁和未发出的信号不在库里。
+
+`docker-compose.yml` 包含 PostgreSQL 16 和 Redis 7，依赖也安装了 `asyncpg` 与 `redis`。当前 API、worker 和 runtime 都没有连接这两个服务。不要把 PostgreSQL 或 Redis 当成现有交易记录的来源。切换数据库之前需要同步驱动和迁移，不能只改连接串。
 
 启动前确认：
 
@@ -26,7 +30,9 @@
 
 ## 自定义策略与行情
 
-`POST /api/symbols` 和 `POST /api/strategy-runs` 都需要 JWT 与 `Idempotency-Key`。交易对必须匹配 `[A-Z0-9]{5,20}`，快线周期必须小于慢线。策略、币种和 K 线缓存位于 API 进程内存中；发布或重启后要重新添加，不能把重启前的内存状态当作已持久化的交易记录。
+`POST /api/symbols` 和 `POST /api/strategy-runs` 都需要 JWT 与 `Idempotency-Key`。交易对必须匹配 `[A-Z0-9]{5,20}`，快线周期必须小于慢线。策略写入 `strategy_states`，按用户名隔离。重启后恢复策略和它的持仓数量，并重新订阅交易对。K 线缓存不会恢复。
+
+关闭策略使用 `POST /api/strategy-runs/{id}/stop`。持仓大于 0 时先卖出，成交后才把状态写成 `stopped`。卖出失败时策略保持运行。没有持仓时只停止，不访问交易所。
 
 K 线接口失败时返回 502。本地已有缓存时继续返回缓存，不把外部请求失败伪装成空行情。
 
@@ -63,10 +69,11 @@ docker compose up --build
 
 ## 备份与恢复
 
-- 备份 PostgreSQL 中的 K 线、订单、成交、审计事件和运行快照。
-- 恢复时先导入数据库，再启动 API 与 runtime。
-- runtime 重放快照之后的事件，并与 Binance 的未完成订单和账户余额对账。
-- 对账不一致时保持非就绪状态，不能仅凭本地缓存继续下单。
+- 备份 `backend/quant.db`。这一个文件包含用户、策略、实盘订单、成交、导入的 K 线和审计事件。
+- 恢复时先放回该文件，再启动 API。API 会按用户加载 `strategy_states`。
+- 启动后核对 Binance 余额。本地策略持仓合计大于交易所余额时，系统禁止新的买入。
+- 实盘解锁不会随数据库恢复。重启后需要重新输入确认短语。
+- 对账不一致时不能仅凭本地持仓继续开仓。先在 Binance 核对真实余额和未完成订单。
 
 ## 密钥轮换
 
@@ -91,4 +98,5 @@ docker compose up --build
 - Binance Key 缺失：账户查询和下单返回 409。
 - 请求明确没有发出：可以使用新的幂等键安全重试。
 - 超时或不确定的服务端错误：先按客户端订单号查询，禁止立即重新提交同一笔订单。
-- PostgreSQL 或 Redis 不可用：阻断新交易，不把缺失记录猜测为成功或失败。
+- `quant.db` 无法打开或写入：API 不能保存用户和策略，先修复文件权限或磁盘，不要换一个空库后继续交易。
+- 对账发现本地持仓多于交易所余额：风险页告警，买入被拒绝。先核对 Binance，再决定是否手动处理差额。
