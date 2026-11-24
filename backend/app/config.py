@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     binance_api_key: str = ""
     binance_api_secret: str = ""
     live_trading_enabled: bool = False
+    live_build_enabled: bool = False
     live_confirmation_phrase: str = "I_UNDERSTAND_LIVE_RISK"
     max_order_notional: float = 100
     max_daily_loss: float = 25

@@ -17,3 +17,5 @@ coverage/
 data/
 postgres-data/
 redis-data/
+*.db
+*.egg-info/
